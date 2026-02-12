@@ -3,6 +3,8 @@ from agents.ifql import IFQLAgent
 from agents.iql import IQLAgent
 from agents.rebrac import ReBRACAgent
 from agents.sac import SACAgent
+from agents.driftql import DriftQLAgent
+
 
 agents = dict(
     fql=FQLAgent,
@@ -10,4 +12,5 @@ agents = dict(
     iql=IQLAgent,
     rebrac=ReBRACAgent,
     sac=SACAgent,
+    driftql=DriftQLAgent,
 )
