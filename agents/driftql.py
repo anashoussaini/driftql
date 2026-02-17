@@ -1,5 +1,5 @@
-import os
 import copy
+import os
 from typing import Any, Sequence
 
 import flax
@@ -11,7 +11,6 @@ import optax
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
-
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
@@ -199,9 +198,9 @@ def compute_drift_field_conditional(
     # If use_state=False we pass None-like placeholders through vmap cleanly
     if use_state:
         assert obs_feat is not None and pos_obs_feat is not None
-        V, DP, DN, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = jax.vmap(
-            per_item, in_axes=(0, 0, 0, 0)
-        )(gen_a, pos_a, obs_feat, pos_obs_feat)
+        V, DP, DN, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = jax.vmap(per_item, in_axes=(0, 0, 0, 0))(
+            gen_a, pos_a, obs_feat, pos_obs_feat
+        )
     else:
         V, DP, DN, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = jax.vmap(
             per_item, in_axes=(0, 0, None, None)
@@ -315,21 +314,23 @@ class DriftQLAgent(flax.struct.PyTreeNode):
         bc_actions = bc_raw.reshape(drift_bs, Nneg, action_dim)  # [B, Nneg, A]
 
         temps = tuple(self.config['drift_temps'])
-        V, drift_pos_total, drift_neg_total, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = compute_drift_field_conditional(
-            gen_a=bc_actions,
-            pos_a=pos_actions,
-            obs_feat=obs_feat,
-            pos_obs_feat=pos_obs_feat,
-            action_temp=float(self.config['action_temp']),
-            state_temp=float(self.config['state_temp']),
-            use_state=bool(self.config['drift_use_state']),
-            temps=temps,
-            drift_normalize=bool(self.config['drift_normalize']),
-            eps=float(self.config['drift_eps']),
+        V, drift_pos_total, drift_neg_total, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = (
+            compute_drift_field_conditional(
+                gen_a=bc_actions,
+                pos_a=pos_actions,
+                obs_feat=obs_feat,
+                pos_obs_feat=pos_obs_feat,
+                action_temp=float(self.config['action_temp']),
+                state_temp=float(self.config['state_temp']),
+                use_state=bool(self.config['drift_use_state']),
+                temps=temps,
+                drift_normalize=bool(self.config['drift_normalize']),
+                eps=float(self.config['drift_eps']),
+            )
         )
 
         eta = float(self.config['drift_eta'])
-        target = jax.lax.stop_gradient(jnp.clip(bc_actions + eta * V, -1.0, 1.0))
+        target = jax.lax.stop_gradient(bc_actions + eta * V)
         bc_drift_loss = jnp.mean((bc_actions - target) ** 2)
 
         # Total (sum over temps) logs
@@ -354,7 +355,7 @@ class DriftQLAgent(flax.struct.PyTreeNode):
 
         # Per-temp logs (after optional drift_normalize)
         for i, T in enumerate(temps):
-            tau_key = f"{float(T):.4f}".rstrip("0").rstrip(".").replace(".", "p")
+            tau_key = f'{float(T):.4f}'.rstrip('0').rstrip('.').replace('.', 'p')
             info[f'drift/tau_{tau_key}/norm'] = jnp.mean(v_norms[:, i])
             info[f'drift/tau_{tau_key}/sq'] = jnp.mean(v_sqs[:, i])
             info[f'drift/tau_{tau_key}/pos_norm'] = jnp.mean(pos_norms[:, i])
@@ -398,7 +399,9 @@ class DriftQLAgent(flax.struct.PyTreeNode):
 
         info = {
             'actor_loss': actor_loss,
-            'bc_drift_loss': bc_info['bc_drift_loss'],
+            'bc_drift_loss': bc_info['bc_drift_loss']
+            * self.config['alpha'],  # weighted drift loss for fair comparison across alphas
+            'bc_drift_loss_raw': bc_info['bc_drift_loss'],
             'drift_norm': bc_info['drift_norm'],
             'q_loss': q_loss,
             'q': q.mean(),
@@ -465,7 +468,6 @@ class DriftQLAgent(flax.struct.PyTreeNode):
         actions = jnp.clip(raw_actions, -1.0, 1.0)
         return actions
 
-
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         rng = jax.random.PRNGKey(seed)
@@ -495,7 +497,6 @@ class DriftQLAgent(flax.struct.PyTreeNode):
             layer_norm=config['actor_layer_norm'],
             encoder=encoders.get('actor_bc_drift'),
         )
-
 
         network_info = dict(
             critic=(critic_def, (ex_observations, ex_actions)),
@@ -531,7 +532,7 @@ def get_config():
             ob_dims=ml_collections.config_dict.placeholder(list),
             action_dim=ml_collections.config_dict.placeholder(int),
             lr=3e-4,
-            batch_size=256,
+            batch_size=512,
             actor_hidden_dims=(512, 512, 512, 512),
             value_hidden_dims=(512, 512, 512, 512),
             layer_norm=True,
@@ -542,18 +543,20 @@ def get_config():
             # Same role as FQL's BC coefficient alpha: balance behavior regularization vs Q
             alpha=10.0,
             # ---- Drift configuration ----
-            drift_use_state=True,  # conditional drift (recommended True)
-            action_temp=0.05,  # scaling for action component in kernel
-            state_temp=0.5,  # scaling for state component in kernel
+            drift_use_state=False,  # conditional drift (recommended True)
+            action_temp=0.5,  # scaling for action component in kernel
+            state_temp=1.0,  # scaling for state component in kernel
             drift_eps=1e-12,
+
+
             # New (needed) knobs:
-            drift_nneg=8,  # Nneg generated actions per state (must be >1 ideally)
-            drift_npos=4,  # Npos positives per state (in-batch kNN if drift_use_state=True)
-            drift_temps=(0.02, 0.05, 0.2),  # multi-temperature (paper-style)
+            drift_nneg=128,  # Nneg generated actions per state (must be >1 ideally)
+            drift_npos=1,  # Npos positives per state (in-batch kNN if drift_use_state=True)
+            drift_temps=(0.5,),  # multi-temperature (paper-style)
             drift_normalize=True,  # normalize drift magnitude (paper A.6 style)
             drift_eta=1.0,  # drift step size eta
             # If you want faster drift compute, reduce this (<= batch_size)
-            drift_batch_size=256,
+            drift_batch_size=128,
             normalize_q_loss=False,
             encoder=ml_collections.config_dict.placeholder(str),  # None, 'impala_small', ...
         )
