@@ -44,11 +44,6 @@ def _alg2_attention(logits: jnp.ndarray) -> jnp.ndarray:
 def _compute_drift_one_temp(
     gen_a: jnp.ndarray,  # [Nneg, A]
     pos_a: jnp.ndarray,  # [Npos, A]
-    gen_s: jnp.ndarray | None,  # [Nneg, S] (optional)
-    pos_s: jnp.ndarray | None,  # [Npos, S] (optional)
-    action_temp: float,
-    state_temp: float,
-    use_state: bool,
     temp: float,
     eps: float = 1e-12,
 ) -> jnp.ndarray:
@@ -64,56 +59,39 @@ def _compute_drift_one_temp(
     where drift_pos is weighted sum of pos actions, drift_neg is weighted sum of neg actions.
     """
     Nneg, act_dim = gen_a.shape
-    Npos = pos_a.shape[0]
+    Npos = pos_a.shape[0]  # should be 1
 
-    if use_state:
-        assert gen_s is not None and pos_s is not None
-        gen_feat = jnp.concatenate([gen_s / state_temp, gen_a / action_temp], axis=-1)  # [Nneg, S+A]
-        pos_feat = jnp.concatenate([pos_s / state_temp, pos_a / action_temp], axis=-1)  # [Npos, S+A]
-        neg_feat = gen_feat  # negatives are the generated set itself
-    else:
-        gen_feat = gen_a / action_temp
-        pos_feat = pos_a / action_temp
-        neg_feat = gen_feat
+    # Distances in action space only
+    dist_pos = _pairwise_l2(gen_a, pos_a, eps=eps)  # [Nneg, 1]
+    dist_neg = _pairwise_l2(gen_a, gen_a, eps=eps)  # [Nneg, Nneg]
 
-    # Distances
-    dist_pos = _pairwise_l2(gen_feat, pos_feat, eps=eps)  # [Nneg, Npos]
-    dist_neg = _pairwise_l2(gen_feat, neg_feat, eps=eps)  # [Nneg, Nneg]
-
-    # Mask self in negatives (diagonal)
+    # mask self-negatives
     idx = jnp.arange(Nneg)
     dist_neg = dist_neg.at[idx, idx].set(1e6)
 
-    # Logits as in paper: -dist / T
+    # logits
     logit_pos = -dist_pos / temp
     logit_neg = -dist_neg / temp
 
-    # Concat for joint normalization across both pos/neg targets
-    logits = jnp.concatenate([logit_pos, logit_neg], axis=-1)  # [Nneg, Npos+Nneg]
-    A = _alg2_attention(logits)  # [Nneg, Npos+Nneg]
+    logits = jnp.concatenate([logit_pos, logit_neg], axis=-1)  # [Nneg, 1+Nneg]
+    A = _alg2_attention(logits)
 
-    A_pos = A[:, :Npos]  # [Nneg, Npos]
+    A_pos = A[:, :Npos]  # [Nneg, 1]
     A_neg = A[:, Npos:]  # [Nneg, Nneg]
 
-    # Weights from Alg.2
-    W_pos = A_pos * jnp.sum(A_neg, axis=1, keepdims=True)  # [Nneg, Npos]
+    W_pos = A_pos * jnp.sum(A_neg, axis=1, keepdims=True)  # [Nneg, 1]
     W_neg = A_neg * jnp.sum(A_pos, axis=1, keepdims=True)  # [Nneg, Nneg]
 
     drift_pos = W_pos @ pos_a  # [Nneg, A]
     drift_neg = W_neg @ gen_a  # [Nneg, A]
-
     V = drift_pos - drift_neg
+
     return V, drift_pos, drift_neg
 
 
 def compute_drift_field_conditional(
     gen_a: jnp.ndarray,  # [B, Nneg, A]
     pos_a: jnp.ndarray,  # [B, Npos, A]
-    obs_feat: jnp.ndarray | None,  # [B, S] (query states)
-    pos_obs_feat: jnp.ndarray | None,  # [B, Npos, S] (positive states)
-    action_temp: float,
-    state_temp: float,
-    use_state: bool,
     temps: Sequence[float],
     drift_normalize: bool,
     eps: float = 1e-12,
@@ -133,14 +111,8 @@ def compute_drift_field_conditional(
       neg_sqs:           [B, T]
     """
 
-    def per_item(gen_a_i, pos_a_i, s_i, pos_s_i):
+    def per_item(gen_a_i, pos_a_i):
         # Expand query state to [Nneg, S] if needed
-        if use_state:
-            assert s_i is not None and pos_s_i is not None
-            gen_s_i = jnp.repeat(s_i[None, :], gen_a_i.shape[0], axis=0)  # [Nneg, S]
-        else:
-            gen_s_i = None
-
         V_sum = jnp.zeros_like(gen_a_i)
         pos_sum = jnp.zeros_like(gen_a_i)
         neg_sum = jnp.zeros_like(gen_a_i)
@@ -151,23 +123,29 @@ def compute_drift_field_conditional(
         v_sq_list = []
         pos_sq_list = []
         neg_sq_list = []
+        lam_list = []
+        v_raw_norm_list = []
+        v_raw_sq_list = []
 
         for T in temps:
             V_T, dp_T, dn_T = _compute_drift_one_temp(
                 gen_a=gen_a_i,
                 pos_a=pos_a_i,
-                gen_s=gen_s_i,
-                pos_s=pos_s_i if use_state else None,
-                action_temp=action_temp,
-                state_temp=state_temp,
-                use_state=use_state,
                 temp=float(T),
                 eps=eps,
             )
+
+            act_dim = gen_a_i.shape[-1]
+            raw_sq = jnp.mean(jnp.sum(V_T * V_T, axis=-1)) / act_dim
+            raw_norm = jnp.mean(_l2_norm(V_T, axis=-1))
+            lam = jnp.sqrt(raw_sq + eps)
+            lam = jax.lax.stop_gradient(lam)
+
+            lam_list.append(lam)
+            v_raw_norm_list.append(raw_norm)
+            v_raw_sq_list.append(raw_sq)
+
             if drift_normalize:
-                act_dim = gen_a_i.shape[-1]
-                lam = jnp.sqrt(jnp.mean(jnp.sum(V_T * V_T, axis=-1)) / act_dim + eps)
-                lam = jax.lax.stop_gradient(lam)
                 V_T = V_T / lam
                 dp_T = dp_T / lam
                 dn_T = dn_T / lam
@@ -179,6 +157,7 @@ def compute_drift_field_conditional(
             v_norm_list.append(jnp.mean(_l2_norm(V_T, axis=-1)))
             pos_norm_list.append(jnp.mean(_l2_norm(dp_T, axis=-1)))
             neg_norm_list.append(jnp.mean(_l2_norm(dn_T, axis=-1)))
+
             v_sq_list.append(jnp.mean(jnp.sum(V_T * V_T, axis=-1)))
             pos_sq_list.append(jnp.mean(jnp.sum(dp_T * dp_T, axis=-1)))
             neg_sq_list.append(jnp.mean(jnp.sum(dn_T * dn_T, axis=-1)))
@@ -193,34 +172,13 @@ def compute_drift_field_conditional(
             jnp.stack(v_sq_list, axis=0),
             jnp.stack(pos_sq_list, axis=0),
             jnp.stack(neg_sq_list, axis=0),
+            jnp.stack(lam_list, axis=0),
+            jnp.stack(v_raw_norm_list, axis=0),
+            jnp.stack(v_raw_sq_list, axis=0),
         )
 
-    # If use_state=False we pass None-like placeholders through vmap cleanly
-    if use_state:
-        assert obs_feat is not None and pos_obs_feat is not None
-        V, DP, DN, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = jax.vmap(per_item, in_axes=(0, 0, 0, 0))(
-            gen_a, pos_a, obs_feat, pos_obs_feat
-        )
-    else:
-        V, DP, DN, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = jax.vmap(
-            per_item, in_axes=(0, 0, None, None)
-        )(gen_a, pos_a, None, None)
+    return jax.vmap(per_item, in_axes=(0, 0))(gen_a, pos_a)
 
-    return V, DP, DN, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs
-
-
-def _inbatch_knn_indices(x: jnp.ndarray, k: int) -> jnp.ndarray:
-    """
-    In-batch kNN indices by L2 distance (smallest distance = nearest).
-    Returns idx [B, k], includes self (distance 0).
-    """
-    B = x.shape[0]
-    k = int(min(k, B))
-    # Pairwise distances [B,B]
-    dist = _pairwise_l2(x, x, eps=1e-12)
-    sim = -dist
-    _, idx = jax.lax.top_k(sim, k)  # top-k similarity => nearest
-    return idx
 
 
 class DriftQLAgent(flax.struct.PyTreeNode):
@@ -281,27 +239,8 @@ class DriftQLAgent(flax.struct.PyTreeNode):
             pos_actions_pool = batch['actions']
             drift_bs = batch_size
 
-        # Encode observation features if configured
-        obs_feat = None
-        if self.config['drift_use_state']:
-            if self.config['encoder'] is not None:
-                # Use the same encoder module as actor_bc_drift (exposed via ModuleDict entry)
-                obs_feat = self.network.select('actor_bc_drift_encoder')(obs)
-            else:
-                obs_feat = obs
-
-            obs_feat = jax.lax.stop_gradient(obs_feat)  # used only for kernels / neighbor selection
-
-        # Build positives per state
-        Npos = int(self.config['drift_npos'])
-        if (Npos > 1) and (obs_feat is not None):
-            nn_idx = _inbatch_knn_indices(obs_feat, Npos)  # [B, Npos]
-            pos_actions = jnp.take(pos_actions_pool, nn_idx, axis=0)  # [B, Npos, A]
-            pos_obs_feat = jnp.take(obs_feat, nn_idx, axis=0)  # [B, Npos, S]
-        else:
-            # Fallback: just use the paired dataset action as the only positive
-            pos_actions = pos_actions_pool[:, None, :]  # [B, 1, A]
-            pos_obs_feat = obs_feat[:, None, :] if obs_feat is not None else None
+        pos_actions = pos_actions_pool[:, None, :]  # [B, 1, A]
+        pos_actions = jnp.clip(pos_actions, -1.0, 1.0)
 
         # Build Nneg generated actions per state
         Nneg = int(self.config['drift_nneg'])
@@ -312,26 +251,107 @@ class DriftQLAgent(flax.struct.PyTreeNode):
         obs_rep = jnp.repeat(obs, repeats=Nneg, axis=0)  # [B*Nneg, ...]
         bc_raw = self.network.select('actor_bc_drift')(obs_rep, noises, params=grad_params)
         bc_actions = bc_raw.reshape(drift_bs, Nneg, action_dim)  # [B, Nneg, A]
+        bc_actions = jnp.clip(bc_actions, -1.0, 1.0)
 
-        temps = tuple(self.config['drift_temps'])
-        V, drift_pos_total, drift_neg_total, v_norms, pos_norms, neg_norms, v_sqs, pos_sqs, neg_sqs = (
-            compute_drift_field_conditional(
-                gen_a=bc_actions,
-                pos_a=pos_actions,
-                obs_feat=obs_feat,
-                pos_obs_feat=pos_obs_feat,
-                action_temp=float(self.config['action_temp']),
-                state_temp=float(self.config['state_temp']),
-                use_state=bool(self.config['drift_use_state']),
-                temps=temps,
-                drift_normalize=bool(self.config['drift_normalize']),
-                eps=float(self.config['drift_eps']),
-            )
+        temps_cfg = self.config['drift_temps']
+        temps = (float(temps_cfg),) if isinstance(temps_cfg, (int, float)) else tuple(temps_cfg)
+
+        (
+            V,
+            drift_pos_total,
+            drift_neg_total,
+            v_norms,
+            pos_norms,
+            neg_norms,
+            v_sqs,
+            pos_sqs,
+            neg_sqs,
+            lams,
+            v_raw_norms,
+            v_raw_sqs,
+        ) = compute_drift_field_conditional(
+            gen_a=bc_actions,
+            pos_a=pos_actions,
+            temps=temps,
+            drift_normalize=bool(self.config['drift_normalize']),
+            eps=float(self.config['drift_eps']),
         )
 
         eta = float(self.config['drift_eta'])
-        target = jax.lax.stop_gradient(bc_actions + eta * V)
+        target = jax.lax.stop_gradient(jnp.clip(bc_actions + eta * V, -1.0, 1.0))
         bc_drift_loss = jnp.mean((bc_actions - target) ** 2)
+
+        # I ADDED THIS BLOCK TO GET MORE DIAGNOSTICS
+        # ---------------- NEW: diagnostics that move under drift_normalize=True ----------------
+        # Work in *clipped* action space for interpretation (env uses clipped actions)
+        x = bc_actions  # already clipped [B, Nneg, A]
+        y = pos_actions  # already clipped [B, 1, A], broadcasts
+
+        # drifted actions (clipped)
+        x_drift_preclip = x + eta * V
+        x_drift = jnp.clip(x_drift_preclip, -1.0, 1.0)
+
+        # How far are generated actions from GT before/after drift?
+        # gt_mse_pre = jnp.mean((x - y) ** 2)
+
+        # x_drift_preclip = x + eta * V  # [B, Nneg, A]
+        # x_drift = jnp.clip(x_drift_preclip, -1.0, 1.0)
+        # gt_mse_post = jnp.mean((x_drift - y) ** 2)
+
+        # gt_mse_improve = gt_mse_pre - gt_mse_post
+
+        # Do we saturate (clip) a lot if we were to apply the drift step in action space?
+        drift_clip_frac = jnp.mean((jnp.abs(x_drift_preclip) > 1.0).astype(jnp.float32))
+
+        # How often is the actor itself outputting out-of-range values (pre-clip)?
+        bc_oob_frac = jnp.mean((jnp.abs(bc_raw) > 1.0).astype(jnp.float32))  # use bc_raw here if you want "true" oob
+
+        # Per-sample MSE (per state, per negative sample)
+        per_sample_pre = jnp.mean((x - y) ** 2, axis=-1)  # [B, Nneg]
+        per_sample_post = jnp.mean((x_drift - y) ** 2, axis=-1)  # [B, Nneg]
+
+        # Mean over all samples (can worsen due to diversity; keep for reference)
+        gt_mse_pre = jnp.mean(per_sample_pre)
+        gt_mse_post = jnp.mean(per_sample_post)
+        gt_mse_improve = gt_mse_pre - gt_mse_post
+
+        # Min over samples per state (best sample)
+        gt_mse_min_pre = jnp.mean(jnp.min(per_sample_pre, axis=1))
+        gt_mse_min_post = jnp.mean(jnp.min(per_sample_post, axis=1))
+        gt_mse_min_improve = gt_mse_min_pre - gt_mse_min_post
+
+        # 10th percentile per state (stable “best-ish” sample)
+        Nneg = per_sample_pre.shape[1]
+        k = jnp.maximum(1, (Nneg * 10) // 100)  # 10% index, integer
+        # sort ascending; take k-th smallest (k-1 index)
+        sorted_pre = jnp.sort(per_sample_pre, axis=1)
+        sorted_post = jnp.sort(per_sample_post, axis=1)
+        gt_mse_p10_pre = jnp.mean(sorted_pre[:, k - 1])
+        gt_mse_p10_post = jnp.mean(sorted_post[:, k - 1])
+        gt_mse_p10_improve = gt_mse_p10_pre - gt_mse_p10_post
+
+        # Alignment: compute cosine only on the closest 10% samples (much more meaningful)
+        # mask = samples with MSE <= p10 threshold per state
+        p10_thresh = sorted_pre[:, k - 1][:, None]  # [B, 1]
+        mask = (per_sample_pre <= p10_thresh).astype(jnp.float32)  # [B, Nneg]
+
+        # Alignment: does V point toward (y - x)?
+        dir_to_gt = y - x
+        v_norm = _l2_norm(V, axis=-1, eps=1e-12)
+        gt_norm = _l2_norm(dir_to_gt, axis=-1, eps=1e-12)
+        cos_align = jnp.mean(jnp.sum(V * dir_to_gt, axis=-1) / (v_norm * gt_norm + 1e-12))
+        cos_per = jnp.sum(V * dir_to_gt, axis=-1) / (v_norm * gt_norm + 1e-12)  # [B, Nneg]
+        cos_align_all = jnp.mean(cos_per)
+
+        cos_align_p10 = jnp.sum(cos_per * mask) / (jnp.sum(mask) + 1e-12)
+
+        # Pre-normalization scale statistics (these actually change if behavior changes)
+        lam_mean = jnp.mean(lams)  # mean over B and temps
+        lam_min = jnp.min(lams)
+        lam_max = jnp.max(lams)
+
+        v_raw_sq_mean = jnp.mean(v_raw_sqs)  # per-dim mean square before norm
+        v_raw_norm_mean = jnp.mean(v_raw_norms)  # mean L2 norm before norm
 
         # Total (sum over temps) logs
         drift_norm_total = jnp.mean(_l2_norm(V, axis=-1))
@@ -351,6 +371,24 @@ class DriftQLAgent(flax.struct.PyTreeNode):
             'drift_neg_sq_total': drift_neg_sq_total,
             'npos': jnp.array(pos_actions.shape[1]),
             'nneg': jnp.array(bc_actions.shape[1]),
+            # NEW diagnostics (good progress signals)
+            'drift/gt_mse_pre': gt_mse_pre,
+            'drift/cos_align_all': cos_align_all,
+            'drift/cos_align_p10': cos_align_p10,
+            'drift/gt_mse_p10_pre': gt_mse_p10_pre,
+            'drift/gt_mse_p10_post': gt_mse_p10_post,
+            'drift/gt_mse_p10_improve': gt_mse_p10_improve,
+            'drift/gt_mse_min_pre': gt_mse_min_pre,
+            'drift/gt_mse_min_post': gt_mse_min_post,
+            'drift/gt_mse_min_improve': gt_mse_min_improve,
+            'drift/cos_align': cos_align,
+            'drift/drift_clip_frac': drift_clip_frac,
+            'drift/bc_oob_frac': bc_oob_frac,
+            'drift/lam_mean': lam_mean,
+            'drift/lam_min': lam_min,
+            'drift/lam_max': lam_max,
+            'drift/v_raw_sq_mean': v_raw_sq_mean,
+            'drift/v_raw_norm_mean': v_raw_norm_mean,
         }
 
         # Per-temp logs (after optional drift_normalize)
@@ -362,6 +400,9 @@ class DriftQLAgent(flax.struct.PyTreeNode):
             info[f'drift/tau_{tau_key}/neg_norm'] = jnp.mean(neg_norms[:, i])
             info[f'drift/tau_{tau_key}/pos_sq'] = jnp.mean(pos_sqs[:, i])
             info[f'drift/tau_{tau_key}/neg_sq'] = jnp.mean(neg_sqs[:, i])
+            info[f'drift/tau_{tau_key}/lam'] = jnp.mean(lams[:, i])
+            info[f'drift/tau_{tau_key}/raw_norm'] = jnp.mean(v_raw_norms[:, i])
+            info[f'drift/tau_{tau_key}/raw_sq'] = jnp.mean(v_raw_sqs[:, i])
 
         return bc_drift_loss, info
 
@@ -380,6 +421,7 @@ class DriftQLAgent(flax.struct.PyTreeNode):
         # Q loss on actor_bc_drift (same network!)
         noises = jax.random.normal(noise_rng, (batch_size, action_dim))
         actor_raw = self.network.select('actor_bc_drift')(batch['observations'], noises, params=grad_params)
+
         actor_raw = jnp.clip(actor_raw, -1.0, 1.0)
         # actor_actions = jnp.tanh(actor_raw)  # keep consistent with your drift training
         qs = self.network.select('critic')(batch['observations'], actions=actor_raw)
@@ -539,7 +581,7 @@ def get_config():
             actor_layer_norm=False,
             discount=0.99,
             tau=0.005,
-            q_agg='mean',
+            q_agg='min',
             # Same role as FQL's BC coefficient alpha: balance behavior regularization vs Q
             alpha=10.0,
             # ---- Drift configuration ----
@@ -547,12 +589,10 @@ def get_config():
             action_temp=0.5,  # scaling for action component in kernel
             state_temp=1.0,  # scaling for state component in kernel
             drift_eps=1e-12,
-
-
             # New (needed) knobs:
             drift_nneg=128,  # Nneg generated actions per state (must be >1 ideally)
             drift_npos=1,  # Npos positives per state (in-batch kNN if drift_use_state=True)
-            drift_temps=(0.5,),  # multi-temperature (paper-style)
+            drift_temps=(0.4),  # multi-temperature (paper-style)
             drift_normalize=True,  # normalize drift magnitude (paper A.6 style)
             drift_eta=1.0,  # drift step size eta
             # If you want faster drift compute, reduce this (<= batch_size)
