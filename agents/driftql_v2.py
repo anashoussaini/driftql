@@ -213,10 +213,6 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         bc_raw = self.teacher_network.select('actor_bc_drift')(obs_rep, noises, params=grad_params)
         bc_actions = jnp.tanh(bc_raw).reshape(drift_bs, Nneg, action_dim)  # [B, Nneg, A]
 
-        # Project raw actions into feature space to prevent degenerate attention kernels
-        gen_features = self.teacher_network.select('drift_projector')(bc_actions, params=grad_params)
-        pos_features = self.teacher_network.select('drift_projector')(pos_actions, params=grad_params)
-
         temps_cfg = self.config['drift_temps']
         temps = (float(temps_cfg),) if isinstance(temps_cfg, (int, float)) else tuple(temps_cfg)
 
@@ -226,8 +222,6 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         ) = compute_drift_field_conditional(
             gen_a=bc_actions,
             pos_a=pos_actions,
-            gen_f=gen_features,
-            pos_f=pos_features,
             temps=temps,
             drift_normalize=bool(self.config['drift_normalize']),
             eps=float(self.config['drift_eps']),
@@ -242,11 +236,10 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         # Diagnostics updated to reflect tanh space
         x = bc_actions
         y = pos_actions
-        x_drift_preclip = bc_raw.reshape(drift_bs, Nneg, action_dim) + eta * V
-        x_drift = jnp.tanh(x_drift_preclip)
+        x_drift = bc_actions + eta * V
 
-        drift_clip_frac = jnp.mean((jnp.abs(x_drift_preclip) > 1.0).astype(jnp.float32))
-        bc_oob_frac = jnp.mean((jnp.abs(bc_raw) > 1.0).astype(jnp.float32))
+        drift_clip_frac = jnp.mean((jnp.abs(x_drift) > 1.0).astype(jnp.float32))
+        bc_oob_frac = jnp.mean((jnp.abs(bc_raw.reshape(drift_bs, Nneg, action_dim)) > 1.0).astype(jnp.float32))
 
         per_sample_pre = jnp.mean((x - y) ** 2, axis=-1)
         per_sample_post = jnp.mean((x_drift - y) ** 2, axis=-1)
@@ -381,8 +374,10 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
             network.params[f'modules_{module_name}'],
             network.params[f'modules_target_{module_name}'],
         )
-        new_params = network.params.copy()
-        new_params[f'modules_target_{module_name}'] = new_target_params
+        new_params = flax.core.copy(
+            network.params,
+            add_or_replace={f'modules_target_{module_name}': new_target_params},
+        )
         return network.replace(params=new_params)
 
     @jax.jit
@@ -480,31 +475,25 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         )
 
         # Create isolated ModuleDicts
-        critic_info = dict(critic=(critic_def, (ex_observations, ex_actions)),target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)))
-        teacher_info = dict(actor_bc_drift=(actor_bc_drift_def, (ex_observations, ex_actions)), drift_projector=(DriftProjector(), (ex_actions,)))
-        student_info = dict(actor_onestep=(actor_onestep_def, (ex_observations, ex_actions)))
-
-        critic_mod = ModuleDict({k: v[0] for k, v in critic_info.items()})
-        teacher_mod = ModuleDict({k: v[0] for k, v in teacher_info.items()})
-        student_mod = ModuleDict({k: v[0] for k, v in student_info.items()})
+        critic_mod = ModuleDict({'critic': critic_def, 'target_critic': copy.deepcopy(critic_def)})
+        teacher_mod = ModuleDict({'actor_bc_drift': actor_bc_drift_def})
+        student_mod = ModuleDict({'actor_onestep': actor_onestep_def})
 
         critic_tx = optax.adam(learning_rate=config['lr'])
         teacher_tx = optax.adam(learning_rate=config['lr'])
         student_tx = optax.adam(learning_rate=config['lr'])
 
         init_rng, c_rng, t_rng, s_rng = jax.random.split(init_rng, 4)
-
-        # Initialize safely using kwargs matching the network definitions
-        critic_params = critic_mod.init(c_rng, **{k: v[1] for k, v in critic_info.items()})['params']
-        teacher_params = teacher_mod.init(t_rng, **{k: v[1] for k, v in teacher_info.items()})['params']
-        student_params = student_mod.init(s_rng, **{k: v[1] for k, v in student_info.items()})['params']
+        critic_params = critic_mod.init(c_rng, ex_observations, ex_actions)['params']
+        teacher_params = teacher_mod.init(t_rng, ex_observations, ex_actions)['params']
+        student_params = student_mod.init(s_rng, ex_observations, ex_actions)['params']
 
         critic_network = TrainState.create(critic_mod, critic_params, tx=critic_tx)
         teacher_network = TrainState.create(teacher_mod, teacher_params, tx=teacher_tx)
         student_network = TrainState.create(student_mod, student_params, tx=student_tx)
 
-        c_params = critic_network.params.copy()
-        c_params['modules_target_critic'] = c_params['modules_critic']
+        # Manually initialize the target critic
+        c_params = flax.core.copy(critic_network.params, add_or_replace={'modules_target_critic': critic_network.params['modules_critic']},)
         critic_network = critic_network.replace(params=c_params)
 
         config['ob_dims'] = ob_dims
