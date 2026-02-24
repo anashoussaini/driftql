@@ -1,5 +1,4 @@
 import copy
-import os
 from typing import Any
 
 import flax
@@ -11,8 +10,6 @@ import optax
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
-
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 
 class FQLAgent(flax.struct.PyTreeNode):
@@ -27,8 +24,8 @@ class FQLAgent(flax.struct.PyTreeNode):
         rng, sample_rng = jax.random.split(rng)
         next_actions = self.sample_actions(batch['next_observations'], seed=sample_rng)
         next_actions = jnp.clip(next_actions, -1, 1)
-        next_qs = self.network.select('target_critic')(batch['next_observations'], actions=next_actions)
 
+        next_qs = self.network.select('target_critic')(batch['next_observations'], actions=next_actions)
         if self.config['q_agg'] == 'min':
             next_q = next_qs.min(axis=0)
         else:
@@ -68,7 +65,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
         distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-        # Q(s, a) loss.
+        # Q loss.
         actor_actions = jnp.clip(actor_actions, -1, 1)
         qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
         q = jnp.mean(qs, axis=0)
@@ -256,7 +253,7 @@ def get_config():
             ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
             lr=3e-4,  # Learning rate.
-            batch_size=512,  # Batch size.
+            batch_size=256,  # Batch size.
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
             layer_norm=True,  # Whether to use layer normalization.
