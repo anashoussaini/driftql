@@ -23,8 +23,21 @@ def _pairwise_l2(a: jnp.ndarray, b: jnp.ndarray, eps: float = 1e-12) -> jnp.ndar
     """
     Compute pairwise L2 distance between a [N, F] and b [M, F] -> [N, M].
     """
-    diff = a[:, None, :] - b[None, :, :]
-    return _l2_norm(diff, axis=-1, eps=eps)
+    # diff = a[:, None, :] - b[None, :, :]
+    # return _l2_norm(diff, axis=-1, eps=eps)
+
+    """
+    Compute pairwise L2 distance between a [N, F] and b [M, F] -> [N, M].
+    Optimized: uses ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x^T y
+    (avoids materializing [N,M,F]).
+    """
+    # a: [N,F], b: [M,F]
+    a2 = jnp.sum(a * a, axis=-1, keepdims=True)  # [N,1]
+    b2 = jnp.sum(b * b, axis=-1, keepdims=True)  # [M,1]
+    cross = a @ b.T  # [N,M]
+    dist2 = a2 + b2.T - 2.0 * cross  # [N,M]
+    dist2 = jnp.maximum(dist2, 0.0)  # numerical safety
+    return jnp.sqrt(dist2 + eps)
 
 
 def _alg2_attention(logits: jnp.ndarray) -> jnp.ndarray:
@@ -50,9 +63,6 @@ def _compute_drift_one_temp(
     """
     Compute drift V for ONE conditioning state (one group),
     using Alg.2 normalization, returning drift vectors in ACTION space.
-
-    Distances are computed in:
-      feat = [s/state_temp, a/action_temp] if use_state else [a/action_temp]
 
     Drift uses:
       V = drift_pos - drift_neg
@@ -180,15 +190,9 @@ def compute_drift_field_conditional(
     return jax.vmap(per_item, in_axes=(0, 0))(gen_a, pos_a)
 
 
-
 class DriftQLAgent(flax.struct.PyTreeNode):
     """
-    Drift Q-learning agent (FQL-style one-step guidance, but with a drifting BC teacher).
-
-    Networks:
-      - critic / target_critic: ensemble Q(s,a)
-      - actor_bc_drift: one-step drifting teacher trained with drifting loss
-      - actor_onestep_drift: one-step RL policy trained with Q loss + distillation to teacher
+    Drift Q-learning agent.
     """
 
     rng: Any
@@ -425,7 +429,14 @@ class DriftQLAgent(flax.struct.PyTreeNode):
         actor_raw = jnp.clip(actor_raw, -1.0, 1.0)
         # actor_actions = jnp.tanh(actor_raw)  # keep consistent with your drift training
         qs = self.network.select('critic')(batch['observations'], actions=actor_raw)
-        q = jnp.mean(qs, axis=0)
+
+
+        if self.config["q_agg_actor"] == "min":
+            q = qs.min(axis=0)
+        else:
+            q = qs.mean(axis=0)
+
+
         q_loss = -q.mean()
 
         if self.config['normalize_q_loss']:
@@ -435,7 +446,6 @@ class DriftQLAgent(flax.struct.PyTreeNode):
         # Total actor loss: alpha now weights DRIFT regularization strength
         actor_loss = self.config['alpha'] * bc_drift_loss + q_loss
 
-        # Logging metric: MSE to dataset actions
         actions_for_mse = self.sample_actions(batch['observations'], seed=rng)
         mse = jnp.mean((actions_for_mse - batch['actions']) ** 2)
 
@@ -497,7 +507,7 @@ class DriftQLAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0):
-        # One-step policy sampling: z ~ N(0,I), a = tanh(actor(s,z))
+
         action_seed, _ = jax.random.split(seed)
         noises = jax.random.normal(
             action_seed,
@@ -546,7 +556,7 @@ class DriftQLAgent(flax.struct.PyTreeNode):
             actor_bc_drift=(actor_bc_drift_def, (ex_observations, ex_actions)),
         )
 
-        # Make encoder callable for drift kernel state-features
+
         if encoders.get('actor_bc_drift') is not None:
             network_info['actor_bc_drift_encoder'] = (encoders.get('actor_bc_drift'), (ex_observations,))
 
@@ -570,11 +580,11 @@ class DriftQLAgent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='driftql',  # IMPORTANT: must match key in agents/__init__.py
+            agent_name='driftql',
             ob_dims=ml_collections.config_dict.placeholder(list),
             action_dim=ml_collections.config_dict.placeholder(int),
             lr=3e-4,
-            batch_size=512,
+            batch_size=256,
             actor_hidden_dims=(512, 512, 512, 512),
             value_hidden_dims=(512, 512, 512, 512),
             layer_norm=True,
@@ -582,23 +592,17 @@ def get_config():
             discount=0.99,
             tau=0.005,
             q_agg='min',
-            # Same role as FQL's BC coefficient alpha: balance behavior regularization vs Q
+            q_agg_actor='min',
             alpha=10.0,
-            # ---- Drift configuration ----
-            drift_use_state=False,  # conditional drift (recommended True)
-            action_temp=0.5,  # scaling for action component in kernel
-            state_temp=1.0,  # scaling for state component in kernel
             drift_eps=1e-12,
-            # New (needed) knobs:
-            drift_nneg=128,  # Nneg generated actions per state (must be >1 ideally)
-            drift_npos=1,  # Npos positives per state (in-batch kNN if drift_use_state=True)
-            drift_temps=(0.4),  # multi-temperature (paper-style)
-            drift_normalize=True,  # normalize drift magnitude (paper A.6 style)
-            drift_eta=1.0,  # drift step size eta
-            # If you want faster drift compute, reduce this (<= batch_size)
-            drift_batch_size=128,
+            drift_nneg=32,
+            drift_npos=1,
+            drift_temps=(0.2),
+            drift_normalize=True,
+            drift_eta=1.0,
+            drift_batch_size=256,
             normalize_q_loss=False,
-            encoder=ml_collections.config_dict.placeholder(str),  # None, 'impala_small', ...
+            encoder=ml_collections.config_dict.placeholder(str),
         )
     )
     return config
