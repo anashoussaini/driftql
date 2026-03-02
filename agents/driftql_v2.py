@@ -38,12 +38,6 @@ def _l2_norm(x, axis=-1, eps=1e-12):
 def _pairwise_l2(a: jnp.ndarray, b: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
     """
     Compute pairwise L2 distance between a [N, F] and b [M, F] -> [N, M].
-    """
-    # diff = a[:, None, :] - b[None, :, :]
-    # return _l2_norm(diff, axis=-1, eps=eps)
-
-    """
-    Compute pairwise L2 distance between a [N, F] and b [M, F] -> [N, M].
     Optimized: uses ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x^T y
     (avoids materializing [N,M,F]).
     """
@@ -244,6 +238,8 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         bc_actions = bc_raw.reshape(drift_bs, Nneg, action_dim)  # [B, Nneg, A]
         bc_actions = jnp.clip(bc_actions, -1.0, 1.0)
 
+        gen_f = self.teacher_network.select('projector')(bc_actions, params=grad_params)
+        pos_f = self.teacher_network.select('projector')(pos_actions, params=grad_params)
 
         temps_cfg = self.config['drift_temps']
         temps = (float(temps_cfg),) if isinstance(temps_cfg, (int, float)) else tuple(temps_cfg)
@@ -254,6 +250,8 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         ) = compute_drift_field_conditional(
             gen_a=bc_actions,
             pos_a=pos_actions,
+            gen_f=gen_f,
+            pos_f=pos_f,
             temps=temps,
             drift_normalize=bool(self.config['drift_normalize']),
             eps=float(self.config['drift_eps']),
@@ -506,7 +504,7 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
 
         # Create isolated ModuleDicts
         critic_mod = ModuleDict({'critic': critic_def, 'target_critic': copy.deepcopy(critic_def)})
-        teacher_mod = ModuleDict({'actor_bc_drift': actor_bc_drift_def})
+        teacher_mod = ModuleDict({'actor_bc_drift': actor_bc_drift_def, 'projector': DriftProjector()})
         student_mod = ModuleDict({'actor_onestep': actor_onestep_def})
 
         critic_tx = optax.adam(learning_rate=config['lr'])
@@ -514,9 +512,23 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         student_tx = optax.adam(learning_rate=config['lr'])
 
         init_rng, c_rng, t_rng, s_rng = jax.random.split(init_rng, 4)
-        critic_params = critic_mod.init(c_rng, ex_observations, ex_actions)['params']
-        teacher_params = teacher_mod.init(t_rng, ex_observations, ex_actions)['params']
-        student_params = student_mod.init(s_rng, ex_observations, ex_actions)['params']
+
+        critic_params = critic_mod.init(
+            c_rng,
+            critic=(ex_observations, ex_actions),
+            target_critic=(ex_observations, ex_actions)
+        )['params']
+
+        teacher_params = teacher_mod.init(
+            t_rng,
+            actor_bc_drift=(ex_observations, ex_actions),
+            projector=(ex_actions,)
+        )['params']
+
+        student_params = student_mod.init(
+            s_rng,
+            actor_onestep=(ex_observations, ex_actions)
+        )['params']
 
         critic_network = TrainState.create(critic_mod, critic_params, tx=critic_tx)
         teacher_network = TrainState.create(teacher_mod, teacher_params, tx=teacher_tx)
