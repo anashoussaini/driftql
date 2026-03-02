@@ -397,6 +397,27 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
 
         return actor_loss, info
 
+    @jax.jit
+    def total_loss(self, batch, grad_params, rng=None):
+        info = {}
+        rng = rng if rng is not None else self.rng
+        rng, c_rng, t_rng, s_rng = jax.random.split(rng, 4)
+
+        critic_loss, critic_info = self.critic_loss(batch, grad_params, c_rng)
+        for k, v in critic_info.items():
+            info[f'critic/{k}'] = v
+
+        teacher_loss, teacher_info = self.drifting_bc_loss(batch, grad_params, t_rng)
+        for k, v in teacher_info.items():
+            info[f'teacher/{k}'] = v
+
+        student_loss, student_info = self.student_loss(batch, grad_params, s_rng)
+        for k, v in student_info.items():
+            info[f'student/{k}'] = v
+
+        loss = critic_loss + teacher_loss + student_loss
+        return loss, info
+
     def target_update(self, network, module_name):
         new_target_params = jax.tree_util.tree_map(
             lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
