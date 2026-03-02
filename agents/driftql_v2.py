@@ -36,11 +36,35 @@ def _l2_norm(x, axis=-1, eps=1e-12):
 
 
 def _pairwise_l2(a: jnp.ndarray, b: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
-    diff = a[:, None, :] - b[None, :, :]
-    return _l2_norm(diff, axis=-1, eps=eps)
+    """
+    Compute pairwise L2 distance between a [N, F] and b [M, F] -> [N, M].
+    """
+    # diff = a[:, None, :] - b[None, :, :]
+    # return _l2_norm(diff, axis=-1, eps=eps)
+
+    """
+    Compute pairwise L2 distance between a [N, F] and b [M, F] -> [N, M].
+    Optimized: uses ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x^T y
+    (avoids materializing [N,M,F]).
+    """
+    # a: [N,F], b: [M,F]
+    a2 = jnp.sum(a * a, axis=-1, keepdims=True)  # [N,1]
+    b2 = jnp.sum(b * b, axis=-1, keepdims=True)  # [M,1]
+    cross = a @ b.T  # [N,M]
+    dist2 = a2 + b2.T - 2.0 * cross  # [N,M]
+    dist2 = jnp.maximum(dist2, 0.0)  # numerical safety
+    return jnp.sqrt(dist2 + eps)
 
 
 def _alg2_attention(logits: jnp.ndarray) -> jnp.ndarray:
+    """
+    Paper Alg.2 normalization:
+      A_row = softmax(logit, dim=-1)
+      A_col = softmax(logit, dim=-2)
+      A = sqrt(A_row * A_col)
+    logits: [N, M]
+    returns: [N, M]
+    """
     A_row = jax.nn.softmax(logits, axis=-1)
     A_col = jax.nn.softmax(logits, axis=-2)
     return jnp.sqrt(A_row * A_col)
@@ -54,6 +78,14 @@ def _compute_drift_one_temp(
     temp: float,
     eps: float = 1e-12,
 ) -> jnp.ndarray:
+    """
+    Compute drift V for ONE conditioning state (one group),
+    using Alg.2 normalization, returning drift vectors in ACTION space.
+
+    Drift uses:
+      V = drift_pos - drift_neg
+    where drift_pos is weighted sum of pos actions, drift_neg is weighted sum of neg actions.
+    """
     Nneg, act_dim = gen_a.shape
     Npos = pos_a.shape[0]
 
@@ -154,7 +186,6 @@ def compute_drift_field_conditional(
 
 class DriftQLAgentV2(flax.struct.PyTreeNode):
     """
-    Fixed Drift Q-learning agent.
     - critic_network: Q(s,a)
     - teacher_network (actor_bc_drift): drifting teacher
     - student_network (actor_onestep): student policy
@@ -209,9 +240,10 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         noises = jax.random.normal(noise_rng, (drift_bs * Nneg, action_dim))
         obs_rep = jnp.repeat(obs, repeats=Nneg, axis=0)  # [B*Nneg, ...]
 
-        # Use tanh instead of clip to preserve gradients and anti-symmetry
         bc_raw = self.teacher_network.select('actor_bc_drift')(obs_rep, noises, params=grad_params)
-        bc_actions = jnp.tanh(bc_raw).reshape(drift_bs, Nneg, action_dim)  # [B, Nneg, A]
+        bc_actions = bc_raw.reshape(drift_bs, Nneg, action_dim)  # [B, Nneg, A]
+        bc_actions = jnp.clip(bc_actions, -1.0, 1.0)
+
 
         temps_cfg = self.config['drift_temps']
         temps = (float(temps_cfg),) if isinstance(temps_cfg, (int, float)) else tuple(temps_cfg)
@@ -233,7 +265,6 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         target = jax.lax.stop_gradient(bc_actions + eta * V)
         bc_drift_loss = jnp.mean((bc_actions - target) ** 2)
 
-        # Diagnostics updated to reflect tanh space
         x = bc_actions
         y = pos_actions
         x_drift = bc_actions + eta * V
@@ -328,16 +359,16 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         Train the separated student policy with Q loss + Distillation.
         """
         batch_size, action_dim = batch['actions'].shape
-        rng, noise_rng = jax.random.split(rng, 2)
+        rng, noise_rng, bc_rng = jax.random.split(rng, 3)
         noises = jax.random.normal(noise_rng, (batch_size, action_dim))
 
         # Student policy forward
         student_raw = self.student_network.select('actor_onestep')(batch['observations'], noises, params=grad_params)
-        student_actions = jnp.tanh(student_raw)
+        student_actions = jnp.clip(student_raw, -1, 1)
 
         # Teacher policy forward (stop grad)
         teacher_raw = self.teacher_network.select('actor_bc_drift')(batch['observations'], noises)
-        teacher_actions = jax.lax.stop_gradient(jnp.tanh(teacher_raw))
+        teacher_actions = jax.lax.stop_gradient(jnp.clip(teacher_raw, -1, 1))
 
         # Distillation loss
         distill_loss = jnp.mean((student_actions - teacher_actions) ** 2)
@@ -346,7 +377,7 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
         qs = self.critic_network.select('critic')(batch['observations'], actions=student_actions)
 
         # Respect Q-aggregation logic for the actor
-        if self.config['q_agg'] == 'min':
+        if self.config["q_agg_actor"] == "min":
             q = qs.min(axis=0)
         else:
             q = qs.mean(axis=0)
@@ -432,9 +463,8 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
             ),
         )
 
-        # Use student policy and tanh
         raw_actions = self.student_network.select('actor_onestep')(observations, noises)
-        actions = jnp.tanh(raw_actions)
+        actions = jnp.clip(raw_actions, -1.0, 1.0)
         return actions
 
     @classmethod
@@ -511,11 +541,11 @@ class DriftQLAgentV2(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='driftql_v2',  # IMPORTANT: must match key in agents/__init__.py
+            agent_name='driftql_v2',
             ob_dims=ml_collections.config_dict.placeholder(list),
             action_dim=ml_collections.config_dict.placeholder(int),
             lr=3e-4,
-            batch_size=512,
+            batch_size=256,
             actor_hidden_dims=(512, 512, 512, 512),
             value_hidden_dims=(512, 512, 512, 512),
             layer_norm=True,
@@ -523,17 +553,15 @@ def get_config():
             discount=0.99,
             tau=0.005,
             q_agg='min',
+            q_agg_actor='mean',
             alpha=10.0,
-            drift_use_state=False,
-            action_temp=0.5,
-            state_temp=1.0,
             drift_eps=1e-12,
-            drift_nneg=128,
+            drift_nneg=32,
             drift_npos=1,
-            drift_temps=(0.4,),
+            drift_temps=(0.2),
             drift_normalize=True,
             drift_eta=1.0,
-            drift_batch_size=128,
+            drift_batch_size=256,
             normalize_q_loss=False,
             encoder=ml_collections.config_dict.placeholder(str),
         )
