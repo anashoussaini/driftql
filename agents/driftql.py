@@ -1101,7 +1101,7 @@ def get_config():
             discount=0.99,
             tau=0.005,
             q_agg="min",
-            q_agg_actor=None,
+            q_agg_actor="mean",
             alpha=10.0,
             drift_eps=1e-12,
             drift_nneg=32,
