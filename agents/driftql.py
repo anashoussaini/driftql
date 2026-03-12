@@ -1157,7 +1157,7 @@ def get_config():
             v2_use_displacement=True,       # Fix 3: displacement vectors, not positions
             v2_row_softmax_only=False,      # Fix 1: drop column-softmax
             v2_no_cross_weight=False,       # Fix 2: drop cross-weighting
-            v2_separate_softmax=False,      # Fix 4: independent pos/neg softmax
+            v2_separate_softmax=True,      # Fix 4: independent pos/neg softmax
             v2_dim_scale=False,             # Fix 5: tau / sqrt(action_dim)
             v2_beta_repel=1.0,              # repulsion strength multiplier
 
