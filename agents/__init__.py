@@ -15,6 +15,6 @@ agents = dict(
     rebrac=ReBRACAgent,
     sac=SACAgent,
     driftql=DriftQLAgent,
-    driftql_v2=DriftQLAgent,
+    driftql_v2=DriftQLAgentV2,
     driftql_q=DriftQLAgentQ,
 )
