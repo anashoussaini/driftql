@@ -28,7 +28,7 @@ INTEREST = {
     "discount":    {0.99},
     "q_agg":       {"mean"},
     "q_agg_actor": {"mean"},
-    "seeds":       {10, 11, 12},
+    "seeds":       {13, 14, 15, 16, 17},
 }
 
 METRIC_PRIORITY = ["evaluation/success", "evaluation/episode.normalized_return"]

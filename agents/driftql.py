@@ -1106,62 +1106,7 @@ def get_config():
             drift_eps=1e-12,
             drift_nneg=32,
             drift_npos=1,
-            drift_temps=(0.2,),  # FIXED: trailing comma to make it a tuple
-
-            # -------------------------------------------------------
-            # drift style: "kernel" (original), "kernel_v2" (fixed), "contragen"
-            # -------------------------------------------------------
-            drift_style="kernel_v2",
-
-            # contragen-specific (unchanged)
-            contra_diag_boost=100.0,
-            contra_force_scale=1.0,
-            drift_contragen_use_negatives=False,
-
-            # legacy kernel flags (used by drift_style="kernel")
-            drift_scale_distances=False,
-            drift_global_rms_normalize=False,
-            drift_keep_gen_repel=False,
-            drift_kernel_affinity_norm=False,
-
-            # ------------------------------------------------
-            # V2 FIX TOGGLES (used by drift_style="kernel_v2")
-            # ------------------------------------------------
-            # Recommended experiment order:
-            # ------------------------------------------------
-            #   Experiment 1 — displacement only (safest, biggest win):
-            #     v2_use_displacement=True
-            #     (all others False/default)
-            # -------------------------------------------------v
-            #   Experiment 2 — displacement + separate softmax:
-            #     v2_use_displacement=True
-            #     v2_separate_softmax=True
-            # -------------------------------------------------
-            #   Experiment 3 — full fix stack:
-            #     v2_use_displacement=True
-            #     v2_separate_softmax=True
-            #     v2_dim_scale=True
-            # -------------------------------------------------
-            #   Experiment 4 — full fix + repulsion tuning:
-            #     v2_use_displacement=True
-            #     v2_separate_softmax=True
-            #     v2_dim_scale=True
-            #     v2_beta_repel=0.5  (try 0.3, 0.5, 1.0, 2.0)
-            #
-            # For ablation, you can also try the intermediate fixes:
-            #   - v2_row_softmax_only=True (without separate_softmax)
-            #   - v2_no_cross_weight=True  (without separate_softmax)
-            # These are subsumed by separate_softmax=True but useful
-            # for understanding which component matters.
-            # -------------------------------------------------------
-            v2_use_displacement=True,       # Fix 3: displacement vectors, not positions
-            v2_row_softmax_only=False,      # Fix 1: drop column-softmax
-            v2_no_cross_weight=False,       # Fix 2: drop cross-weighting
-            v2_separate_softmax=True,      # Fix 4: independent pos/neg softmax
-            v2_dim_scale=False,             # Fix 5: tau / sqrt(action_dim)
-            v2_beta_repel=1.0,              # repulsion strength multiplier
-
-            # shared
+            drift_temps=(0.2,),
             drift_normalize=True,
             drift_eta=1.0,
             drift_batch_size=256,
