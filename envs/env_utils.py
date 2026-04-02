@@ -1,4 +1,5 @@
 import collections
+import os
 import re
 import time
 
@@ -88,13 +89,23 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
+def load_npz_dataset(dataset_path):
+    """Load a saved offline dataset from an `.npz` bundle."""
+    dataset_path = os.path.expanduser(dataset_path)
+    with np.load(dataset_path, allow_pickle=False) as bundle:
+        return {key: bundle[key] for key in bundle.files}
+
+
+def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, offline_dataset_path=None):
     """Make offline RL environment and datasets.
 
     Args:
         env_name: Name of the environment or dataset.
         frame_stack: Number of frames to stack.
         action_clip_eps: Epsilon for action clipping.
+        offline_dataset_path: Optional path to a custom offline dataset. For
+            OGBench singletask environments, this overrides the default train
+            dataset while keeping the same evaluation environment.
 
     Returns:
         A tuple of the environment, evaluation environment, training dataset, and validation dataset.
@@ -102,14 +113,22 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
 
     if 'singletask' in env_name:
         # OGBench.
-        env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
+        if offline_dataset_path is None:
+            env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
+        else:
+            env = ogbench.make_env_and_datasets(env_name, env_only=True)
+            train_dataset = load_npz_dataset(offline_dataset_path)
+            val_dataset = None
         eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         train_dataset = Dataset.create(**train_dataset)
-        val_dataset = Dataset.create(**val_dataset)
+        if val_dataset is not None:
+            val_dataset = Dataset.create(**val_dataset)
     elif 'antmaze' in env_name and ('diverse' in env_name or 'play' in env_name or 'umaze' in env_name):
         # D4RL AntMaze.
+        if offline_dataset_path is not None:
+            raise ValueError('Custom offline datasets are currently only supported for OGBench singletask environments.')
         from envs import d4rl_utils
 
         env = d4rl_utils.make_env(env_name)
@@ -118,6 +137,8 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
         train_dataset, val_dataset = dataset, None
     elif 'pen' in env_name or 'hammer' in env_name or 'relocate' in env_name or 'door' in env_name:
         # D4RL Adroit.
+        if offline_dataset_path is not None:
+            raise ValueError('Custom offline datasets are currently only supported for OGBench singletask environments.')
         import d4rl.hand_manipulation_suite  # noqa
         from envs import d4rl_utils
 

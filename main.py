@@ -26,6 +26,11 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_bool('save_with_env_name', False, 'Whether to place runs under save_dir/env_name/.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
+flags.DEFINE_string(
+    'offline_dataset_path',
+    None,
+    'Optional path to a custom offline dataset `.npz`. For OGBench singletask envs, overrides the default train split.',
+)
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 0, 'Number of online steps.')
@@ -61,7 +66,11 @@ def main(_):
 
     # Make environment and datasets.
     config = FLAGS.agent
-    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
+    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(
+        FLAGS.env_name,
+        frame_stack=FLAGS.frame_stack,
+        offline_dataset_path=FLAGS.offline_dataset_path,
+    )
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
     if FLAGS.online_steps > 0:
