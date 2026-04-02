@@ -63,6 +63,13 @@ def _cfg_get(cfg, key, default):
         return default
 
 
+def _resolve_noise_dim(cfg, action_dim):
+    noise_dim = int(_cfg_get(cfg, 'noise_dim', action_dim))
+    if noise_dim <= 0:
+        noise_dim = int(action_dim)
+    return noise_dim
+
+
 # =============================================================================
 # Mean-Shift Drift Field
 #
@@ -243,6 +250,7 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
 
         # Read config
         kernel = str(_cfg_get(self.config, 'kernel', 'laplace'))
+        noise_dim = _resolve_noise_dim(self.config, self.config['action_dim'])
         dim_scale = bool(_cfg_get(self.config, 'dim_scale', True))
         drift_normalize = bool(self.config['drift_normalize'])
         temp = float(self.config['drift_temp'])
@@ -264,7 +272,7 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
         pos_a = jnp.clip(pos_actions[:, None, :], -1.0, 1.0)
 
         # Generate Ngen samples per state from current policy
-        noises = jax.random.normal(noise_rng, (drift_bs * Ngen, action_dim))
+        noises = jax.random.normal(noise_rng, (drift_bs * Ngen, noise_dim))
         obs_rep = jnp.repeat(obs, repeats=Ngen, axis=0)
         bc_raw = self.network.select('actor_bc_drift')(obs_rep, noises, params=grad_params)
         gen_a = jnp.clip(bc_raw.reshape(drift_bs, Ngen, action_dim), -1.0, 1.0)
@@ -331,6 +339,7 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
             'drift_repel_norm': repel_norm,
             'npos': jnp.array(pos_a.shape[1]),
             'ngen': jnp.array(Ngen),
+            'noise_dim': jnp.array(noise_dim),
             'drift/kernel': jnp.array(1 if kernel == 'gaussian' else 0),
             'drift/gt_mse_pre': gt_mse_pre,
             'drift/gt_mse_post': gt_mse_post,
@@ -357,7 +366,8 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
         bc_drift_loss, bc_info = self.drifting_bc_loss(batch, grad_params, bc_rng)
 
         # Q-loss: maximize Q(s, f_θ(s,z))
-        noises = jax.random.normal(noise_rng, (batch_size, action_dim))
+        noise_dim = _resolve_noise_dim(self.config, action_dim)
+        noises = jax.random.normal(noise_rng, (batch_size, noise_dim))
         actor_raw = self.network.select('actor_bc_drift')(batch['observations'], noises, params=grad_params)
         actor_raw = jnp.clip(actor_raw, -1.0, 1.0)
         qs = self.network.select('critic')(batch['observations'], actions=actor_raw)
@@ -435,11 +445,12 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0):
         action_seed, _ = jax.random.split(seed)
+        noise_dim = _resolve_noise_dim(self.config, self.config['action_dim'])
         noises = jax.random.normal(
             action_seed,
             (
                 *observations.shape[: -len(self.config['ob_dims'])],
-                self.config['action_dim'],
+                noise_dim,
             ),
         )
         raw_actions = self.network.select('actor_bc_drift')(observations, noises)
@@ -454,6 +465,8 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
 
         ob_dims = ex_observations.shape[1:]
         action_dim = ex_actions.shape[-1]
+        noise_dim = _resolve_noise_dim(config, action_dim)
+        ex_noises = jnp.zeros((*ex_actions.shape[:-1], noise_dim), dtype=ex_actions.dtype)
 
         encoders = dict()
         if config['encoder'] is not None:
@@ -478,7 +491,7 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
         network_info = dict(
             critic=(critic_def, (ex_observations, ex_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
-            actor_bc_drift=(actor_bc_drift_def, (ex_observations, ex_actions)),
+            actor_bc_drift=(actor_bc_drift_def, (ex_observations, ex_noises)),
         )
 
         if encoders.get('actor_bc_drift') is not None:
@@ -500,6 +513,7 @@ class DriftQLMeanShiftAgent(flax.struct.PyTreeNode):
 
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
+        config['noise_dim'] = noise_dim
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
@@ -523,6 +537,7 @@ def get_config():
             # Architecture
             actor_hidden_dims=(512, 512, 512, 512),
             value_hidden_dims=(512, 512, 512, 512),
+            noise_dim=0,  # defaults to action_dim when <= 0
             layer_norm=True,
             actor_layer_norm=False,
             # Critic
