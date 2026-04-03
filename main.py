@@ -3,6 +3,8 @@ import os
 import random
 import time
 
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+
 import jax
 import numpy as np
 import tqdm
