@@ -7,6 +7,7 @@ from agents.driftql import DriftQLAgent
 from agents.driftql_v2 import DriftQLAgentV2
 from agents.driftql_q import DriftQLAgentQ
 from agents.driftql_meanshift import DriftQLMeanShiftAgent
+from agents.drift_ablation import DriftAblationHardcodedAgent
 
 agents = dict(
     fql=FQLAgent,
@@ -18,4 +19,5 @@ agents = dict(
     driftql_v2=DriftQLAgentV2,
     driftql_q=DriftQLAgentQ,
     driftql_meanshift=DriftQLMeanShiftAgent,
+    drift_ablation_hardcoded=DriftAblationHardcodedAgent,
 )
