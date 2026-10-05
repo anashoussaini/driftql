@@ -4,8 +4,8 @@
   <ul align="center" style="list-style: none;">
     <summary>
       <h1>Drift Q-Learning</h1>
+      <p align="center"><img src="assets/neurips_badge.svg" height="52" alt="Accepted to NeurIPS 2026"></p>
       <br>
-      <img src="https://img.shields.io/badge/Accepted%20to-NeurIPS%202026-e97822?style=for-the-badge" alt="Accepted to NeurIPS 2026">
       <h2><a href="https://arxiv.org/abs/2606.00350">Paper</a> &emsp; <a href="https://driftql.github.io/">Project page</a></h2>
     </summary>
   </ul>
