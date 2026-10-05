@@ -4,8 +4,17 @@
   <ul align="center" style="list-style: none;">
     <summary>
       <h1>Drift Q-Learning</h1>
-      <img src="https://img.shields.io/badge/Accepted%20to-NeurIPS%202026-e97822" alt="Accepted to NeurIPS 2026">
-      <h2><a href="https://arxiv.org/abs/2606.00350">Paper</a> &emsp; <a href="https://driftql.github.io/">Project page</a></h2>
+<div style="margin: 15px 0;">
+  <img
+    src="https://img.shields.io/badge/Accepted%20to-NeurIPS%202026-e97822"
+    alt="Accepted to NeurIPS 2026"
+  >
+</div>
+      <h2>
+        <a href="https://arxiv.org/abs/2606.00350">Paper</a>
+        &emsp;
+        <a href="https://driftql.github.io/">Project page</a>
+      </h2>
     </summary>
   </ul>
 </div>
